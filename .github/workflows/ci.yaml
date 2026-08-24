@@ -61,10 +61,12 @@ jobs:
 
       - name: Get changed servers
         shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
         run: |
           cd pr-workspace
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git diff --name-only --diff-filter=AM origin/${{ github.event.pull_request.base.ref }}...HEAD | grep "^servers/" > ../changed-servers.txt || true
+          git fetch origin "$BASE_REF"
+          git diff --name-only --diff-filter=AM "origin/$BASE_REF"...HEAD | grep "^servers/" > ../changed-servers.txt || true
 
       - name: Build and catalog changed servers
         shell: bash
