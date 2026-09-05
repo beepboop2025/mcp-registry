@@ -1,17 +1,32 @@
+name: Carrier exact-source partial catalog and isolated MCP validation
+
 on:
-  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carrier-exact-source-validation
+  cancel-in-progress: false
 
 jobs:
   validate:
-    name: "Code and Server Validation"
+    name: "Partial catalog and isolated MCP validation"
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARRIER_SOURCE_SHA: 1fd371d0c7e97cb622961e3076c6a4d17c8fc6be
+      UPSTREAM_TOOLING_SHA: 8c773729f13f036da8c909be503fe433923a9aa2
     steps:
-      - name: Checkout main for tooling
+      - name: Checkout pinned upstream tooling
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: main
+          repository: docker/mcp-registry
+          ref: 8c773729f13f036da8c909be503fe433923a9aa2
           path: main-tooling
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Install Go for building main tooling
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
@@ -30,19 +45,16 @@ jobs:
       - name: Checkout PR for validation
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: beepboop2025/mcp-registry
+          ref: 1fd371d0c7e97cb622961e3076c6a4d17c8fc6be
           path: pr-workspace
-          fetch-depth: 0
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Install Go for PR branch
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: pr-workspace/go.mod
-
-      - name: Install Task
-        uses: arduino/setup-task@b91d5d2c96a56797b48ac1e0e89220bf64044611 # v2.0.0
-        with:
-          version: 3.x
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker
         uses: docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4 # v4
@@ -58,18 +70,183 @@ jobs:
           cd pr-workspace
           go test ./...
 
-      - name: Get changed servers
+      - name: Bind exact Carrier selection and unchanged security metadata
         shell: bash
         run: |
-          cd pr-workspace
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git diff --name-only --diff-filter=AM origin/${{ github.event.pull_request.base.ref }}...HEAD | grep "^servers/" > ../changed-servers.txt || true
+          set -euo pipefail
+          test "$(git -C main-tooling rev-parse HEAD)" = "$UPSTREAM_TOOLING_SHA"
+          test "$(git -C pr-workspace rev-parse HEAD)" = "$CARRIER_SOURCE_SHA"
+          test -z "$(git -C pr-workspace status --porcelain --untracked-files=all)"
+          printf '%s  %s\n' \
+            51c34fc016889b926f483f48b8b23fd8cd39ee7b88e7973f4c3ecfce001dc370 \
+            pr-workspace/servers/liquilens-evidence-carrier/server.yaml | sha256sum --check --strict
+          printf '%s\n' servers/liquilens-evidence-carrier/server.yaml > changed-servers.txt
+          test "$(wc -l < changed-servers.txt)" -eq 1
+          test -s changed-servers.txt
+          grep -Fx '  disableNetwork: true' pr-workspace/servers/liquilens-evidence-carrier/server.yaml
+          grep -F ':/evidence:ro' pr-workspace/servers/liquilens-evidence-carrier/server.yaml
+          {
+            echo "Carrier source: $CARRIER_SOURCE_SHA"
+            echo "Upstream tooling: $UPSTREAM_TOOLING_SHA"
+            echo "Controller: $GITHUB_SHA"
+            echo "Scope: no-credential fork validation; not upstream acceptance"
+            cat changed-servers.txt
+          } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Build and catalog changed servers
+      - name: Run unchanged upstream validation and image pull
         shell: bash
         run: |
-          # Use safe validation script from main with safe binaries.
-          "${{ github.workspace }}/main-tooling/scripts/ci-validation.sh" \
-            --bin-dir "${{ github.workspace }}/bin" \
-            --workspace "${{ github.workspace }}/pr-workspace" \
-            --changed-servers "${{ github.workspace }}/changed-servers.txt"
+          set -euo pipefail
+          mkdir -p validation-evidence
+          cd pr-workspace
+          ../bin/validate --name liquilens-evidence-carrier 2>&1 | tee ../validation-evidence/upstream-validate.log
+          # Partial validation: upstream --tools ignores disableNetwork/volumes.
+          # Keep it pending; the next step probes the image independently.
+          ../bin/build --pull-community liquilens-evidence-carrier 2>&1 | tee ../validation-evidence/upstream-image-pull.log
+
+      - name: Independent offline read-only MCP discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYPROBE'
+          """Independent isolated probe; does not claim upstream --tools validation."""
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          IMAGE = "ghcr.io/beepboop2025/liquilens-evidence-carrier-mcp@sha256:4e4ffb010b52375b3203b2dc43706c7fa508de2bf8368eca465f49d56392dcea"
+          EXPECTED_TOOLS = {"verify_carrier", "project_carrier", "verify_fleet_brief"}
+
+
+          def checked_json(*args):
+              return json.loads(subprocess.check_output(["docker", *args], text=True, timeout=30))
+
+
+          def check_inspection(item, fixture):
+              assert item["Config"]["Image"] == IMAGE
+              assert item["Config"]["User"] in {"65532", "65532:65532"}
+              host = item["HostConfig"]
+              assert host["NetworkMode"] == "none"
+              assert host["ReadonlyRootfs"] is True
+              assert "ALL" in host["CapDrop"]
+              assert "no-new-privileges=true" in host["SecurityOpt"]
+              assert len(item["Mounts"]) == 1
+              mount = item["Mounts"][0]
+              assert mount["Type"] == "bind" and mount["Source"] == str(fixture)
+              assert mount["Destination"] == "/evidence" and mount["RW"] is False
+              return {"network": host["NetworkMode"], "rootfs_readonly": True,
+                      "evidence_mount_readonly": True, "user": item["Config"]["User"],
+                      "cap_drop": host["CapDrop"], "security_opt": host["SecurityOpt"]}
+
+
+          def check_responses(stdout):
+              assert len(stdout.encode()) < 1048576
+              responses = [json.loads(line) for line in stdout.splitlines() if line.strip()]
+              assert len(responses) == 2
+              assert [r.get("id") for r in responses] == [1, 2]
+              assert all(r.get("jsonrpc") == "2.0" and "error" not in r for r in responses)
+              server = responses[0]["result"]["serverInfo"]
+              assert server["name"] == "io.github.beepboop2025/liquilens-evidence-carrier"
+              assert server["version"] == "0.15.0"
+              tools = responses[1]["result"]["tools"]
+              assert len(tools) == 3 and {t["name"] for t in tools} == EXPECTED_TOOLS
+              for tool in tools:
+                  annotations = tool["annotations"]
+                  assert annotations["readOnlyHint"] is True
+                  assert annotations["destructiveHint"] is False
+                  assert annotations["openWorldHint"] is False
+              return server, sorted(EXPECTED_TOOLS)
+
+
+          def main():
+              evidence = Path("validation-evidence").resolve()
+              evidence.mkdir(exist_ok=True)
+              fixture = Path("synthetic-empty-evidence").resolve()
+              fixture.mkdir(mode=0o755)
+              assert not list(fixture.iterdir())
+              image = checked_json("image", "inspect", IMAGE)[0]
+              assert IMAGE in image["RepoDigests"]
+              cid = subprocess.check_output([
+                  "docker", "create", "--pull", "never", "-i", "--init",
+                  "--cap-drop=ALL", "--security-opt", "no-new-privileges=true",
+                  "--network", "none", "--read-only", "--mount",
+                  f"type=bind,src={fixture},dst=/evidence,readonly", IMAGE,
+              ], text=True, timeout=30).strip()
+              process = None
+              try:
+                  inspected = checked_json("inspect", cid)[0]
+                  isolation = check_inspection(inspected, fixture)
+                  requests = [
+                      {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                          "protocolVersion": "2025-11-25", "capabilities": {},
+                          "clientInfo": {"name": "synthetic-carrier-catalog-validation", "version": "1"}}},
+                      {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                      {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                  ]
+                  process = subprocess.Popen(["docker", "start", "--attach", "--interactive", cid],
+                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                             stderr=subprocess.PIPE, text=True)
+                  stdout, stderr = process.communicate(
+                      "".join(json.dumps(r) + "\n" for r in requests), timeout=60)
+                  (evidence / "offline-discovery-stdout.ndjson").write_text(stdout)
+                  (evidence / "offline-discovery-stderr.txt").write_text(stderr)
+                  assert process.returncode == 0
+                  assert checked_json("inspect", cid)[0]["State"]["ExitCode"] == 0
+                  server, names = check_responses(stdout)
+                  assert not list(fixture.iterdir())
+                  receipt = {
+                      "status": "pass", "scope": "independent_offline_readonly_discovery",
+                      "upstream_exact_tools_path": "pending_not_executed_isolation_controls_omitted_upstream",
+                      "source_sha": os.environ["CARRIER_SOURCE_SHA"],
+                      "upstream_tooling_sha": os.environ["UPSTREAM_TOOLING_SHA"],
+                      "controller_sha": os.environ["GITHUB_SHA"], "image": IMAGE,
+                      "server": server, "tool_names": names, "tool_count": len(names),
+                      "isolation": isolation, "synthetic": True, "tool_calls": 0,
+                      "stdout_sha256": hashlib.sha256(stdout.encode()).hexdigest(),
+                  }
+                  (evidence / "offline-discovery-receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+                  print(json.dumps(receipt, sort_keys=True))
+              finally:
+                  try:
+                      if process is not None and process.poll() is None:
+                          process.kill()
+                          process.communicate(timeout=10)
+                  finally:
+                      subprocess.run(["docker", "rm", "--force", cid], check=True, timeout=30,
+                                     stdout=subprocess.DEVNULL)
+
+
+          if __name__ == "__main__":
+              main()
+          PYPROBE
+
+      - name: Generate unchanged upstream catalog and verify controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd pr-workspace
+          ../bin/catalog liquilens-evidence-carrier 2>&1 | tee ../validation-evidence/upstream-catalog.log
+          catalog=catalogs/liquilens-evidence-carrier/catalog.yaml
+          test -s "$catalog"
+          grep -F 'disableNetwork: true' "$catalog"
+          grep -F ':/evidence:ro' "$catalog"
+          grep -F 'sha256:4e4ffb010b52375b3203b2dc43706c7fa508de2bf8368eca465f49d56392dcea' "$catalog"
+          cp "$catalog" ../validation-evidence/catalog.yaml
+          git diff --exit-code
+          git diff --cached --exit-code
+          {
+            echo "Partial upstream validation and independent isolated discovery passed."
+            echo "Upstream ci-validation.sh / build --tools remains pending: its probe omits declared network and volume controls."
+            echo "This is fork evidence, not upstream acceptance or publication."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain bounded validation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: carrier-partial-validation-${{ github.sha }}
+          path: validation-evidence/
+          if-no-files-found: error
+          retention-days: 30
