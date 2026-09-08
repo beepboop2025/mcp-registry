@@ -77,6 +77,28 @@ func TestRepositoryCacheMissingMalformedOrOversizedDoesNotFallBack(t *testing.T)
 	}
 }
 
+func TestRepositoryCacheRejectsSymlinkAndGroupWritableFiles(t *testing.T) {
+	cache, path := prepareRepositoryCache(t)
+	writeRepositoryCache(t, path, cache)
+	if err := os.Chmod(path, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Client{}).GetProjectRepository(context.Background(), "https://github.com/modelcontextprotocol/servers"); err == nil {
+		t.Fatal("group-writable metadata was accepted")
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(filepath.Dir(path), "link.json")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MCP_REGISTRY_REPOSITORY_CACHE", link)
+	if _, err := (&Client{}).GetProjectRepository(context.Background(), "https://github.com/modelcontextprotocol/servers"); err == nil {
+		t.Fatal("symlink metadata was accepted")
+	}
+}
+
 func prepareRepositoryCache(t *testing.T) (map[string]any, string) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "repositories.json")

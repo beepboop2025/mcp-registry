@@ -38,6 +38,10 @@ func repositoryFromCache(project string) (*github.Repository, bool, error) {
 		return fail("cannot open cache file")
 	}
 	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !opened.Mode().IsRegular() || opened.Mode().Perm()&0o022 != 0 || !os.SameFile(info, opened) {
+		return fail("opened cache does not match the validated regular file")
+	}
 	content, err := io.ReadAll(io.LimitReader(file, repositoryCacheLimit+1))
 	if err != nil || len(content) > repositoryCacheLimit {
 		return fail("content exceeds the size bound or cannot be read")
