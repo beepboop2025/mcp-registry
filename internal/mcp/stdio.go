@@ -109,6 +109,7 @@ func (c *stdioMCPClient) dockerCommand(ctx context.Context) (*exec.Cmd, error) {
 		}
 	}
 	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Env = []string{}
 	// Connection settings come only from the trusted invoking process. In CI a
 	// confined wrapper also fixes the socket and config; examples cannot select
 	// another daemon, credential helper, loader or shell initialization file.
