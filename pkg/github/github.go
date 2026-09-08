@@ -66,6 +66,9 @@ type Client struct {
 }
 
 func (c *Client) GetProjectRepository(ctx context.Context, project string) (*github.Repository, error) {
+	if repository, enabled, err := repositoryFromCache(project); enabled {
+		return repository, err
+	}
 	owner, repo, err := extractOrgAndProject(project)
 	if err != nil {
 		return nil, err
