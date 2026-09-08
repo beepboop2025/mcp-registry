@@ -32,6 +32,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -59,14 +61,77 @@ func newMCPClient(command string, env []string, args ...string) *stdioMCPClient 
 	}
 }
 
+var containerEnvName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// dockerCommand keeps repository-provided examples out of the host CLI's
+// environment. Docker receives them only as literal container arguments.
+func (c *stdioMCPClient) dockerCommand(ctx context.Context) (*exec.Cmd, error) {
+	if c.command != "docker" || len(c.args) == 0 || c.args[0] != "run" {
+		return nil, errors.New("expected Docker run transport")
+	}
+	values := make(map[string]string, len(c.env))
+	for _, entry := range c.env {
+		name, value, ok := strings.Cut(entry, "=")
+		if !ok || !containerEnvName.MatchString(name) || strings.ContainsRune(value, '\x00') {
+			return nil, errors.New("invalid container environment entry")
+		}
+		values[name] = value
+	}
+	args := []string{"run"}
+	for i := 1; i < len(c.args); i++ {
+		arg := c.args[i]
+		switch arg {
+		case "-e", "--env":
+			i++
+			if i >= len(c.args) {
+				return nil, errors.New("missing container environment name")
+			}
+			name := c.args[i]
+			value, ok := values[name]
+			if !ok {
+				return nil, errors.New("container environment has no example value")
+			}
+			args = append(args, "--env", name+"="+value)
+		case "--network":
+			i++
+			if i >= len(c.args) {
+				return nil, errors.New("missing container network")
+			}
+			args = append(args, arg, c.args[i])
+		default:
+			args = append(args, arg)
+			if !strings.HasPrefix(arg, "-") {
+				// Image and container command arguments must remain byte-for-byte
+				// intact, even when the container command itself contains -e.
+				args = append(args, c.args[i+1:]...)
+				i = len(c.args)
+			}
+		}
+	}
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	// Connection settings come only from the trusted invoking process. In CI a
+	// confined wrapper also fixes the socket and config; examples cannot select
+	// another daemon, credential helper, loader or shell initialization file.
+	for _, name := range []string{"PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG",
+		"DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY", "DOCKER_API_VERSION", "SystemRoot", "ProgramW6432"} {
+		if value, ok := os.LookupEnv(name); ok {
+			cmd.Env = append(cmd.Env, name+"="+value)
+		}
+	}
+	return cmd, nil
+}
+
 func (c *stdioMCPClient) Initialize(ctx context.Context, request mcp.InitializeRequest, debug bool) (*mcp.InitializeResult, error) {
 	if c.initialized.Load() {
 		return nil, fmt.Errorf("client already initialized")
 	}
 
 	ctxCmd, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	cmd := exec.CommandContext(ctxCmd, c.command, c.args...)
-	cmd.Env = c.env
+	cmd, err := c.dockerCommand(ctxCmd)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 	cmd.Cancel = func() error {
 		return cmd.Process.Signal(syscall.SIGTERM)
 	}
